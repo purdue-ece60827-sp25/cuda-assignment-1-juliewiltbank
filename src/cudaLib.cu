@@ -60,7 +60,7 @@ int runGpuSaxpy(int vectorSize) {
 	cudaMalloc(&d_x, vectorSize*sizeof(float));
 	cudaMalloc(&d_y, vectorSize*sizeof(float));
 
-	for (int i=0; i < vectorSize; i++) {
+	for (uint64_t i=0; i < vectorSize; i++) {
 		x[i] = static_cast<float>(rand() % MAX_VAL);
 		y[i] = static_cast<float>(rand() % MAX_VAL);
 	}
@@ -124,12 +124,39 @@ int runGpuSaxpy(int vectorSize) {
 
 __global__
 void generatePoints (uint64_t * pSums, uint64_t pSumSize, uint64_t sampleSize) {
-	//	Insert code here
+	// Insert code here
+	curandState_t rng;
+	int threadId = blockIdx.x * blockDim.x + threadIdx.x;
+	if (threadId >= pSumSize) return;
+	curand_init(clock64(), threadId, 0, &rng);
+
+	uint64_t hitCount = 0;
+	float x, y;
+
+	for (uint64_t idx = 0; idx < sampleSize; ++idx) {
+		x = curand_uniform(&rng);
+		y = curand_uniform(&rng);
+			
+		if ( int(x * x + y * y) == 0 ) {
+			++ hitCount;
+		}
+	}
+
+	pSums[threadId] = hitCount;
 }
 
 __global__ 
 void reduceCounts (uint64_t * pSums, uint64_t * totals, uint64_t pSumSize, uint64_t reduceSize) {
 	//	Insert code here
+	int threadId = blockIdx.x * blockDim.x + threadIdx.x;
+    if (threadId >= reduceSize) return;
+
+	uint64_t localSum = 0;
+	for (uint64_t i = threadId; i < pSumSize; i += reduceSize) {
+		localSum += pSums[i];
+	}
+
+	totals[threadId] = localSum;
 }
 
 int runGpuMCPi (uint64_t generateThreadCount, uint64_t sampleSize, 
@@ -164,7 +191,38 @@ double estimatePi(uint64_t generateThreadCount, uint64_t sampleSize,
 	double approxPi = 0;
 
 	//      Insert code here
-	std::cout << "Sneaky, you are ...\n";
-	std::cout << "Compute pi, you must!\n";
+	uint64_t *totals, *d_pSums, *d_totals;
+	totals = (uint64_t*)malloc(sampleSize*sizeof(uint64_t));
+
+	if (totals == NULL) {
+		printf("Unable to malloc memory ... Exiting!");
+		return -1;
+	}
+
+	cudaMalloc(&d_pSums, sampleSize*sizeof(uint64_t));
+	cudaMalloc(&d_totals, sampleSize*sizeof(uint64_t));
+
+	dim3 DimGrid(ceil(sampleSize/256.0), 1, 1);
+	if (sampleSize%256) DimGrid.x++;
+	dim3 DimBlock(256, 1, 1);
+
+	generatePoints<<<DimGrid,DimBlock>>>(d_pSums, generateThreadCount, sampleSize);
+
+	reduceCounts<<<DimGrid,DimBlock>>>(d_pSums, d_totals, generateThreadCount, reduceThreadCount);
+
+	cudaMemcpy(totals, d_totals, sampleSize*sizeof(uint64_t), cudaMemcpyDeviceToHost);
+
+	uint64_t totalHitCount = 0;
+    for (uint64_t i = 0; i < reduceThreadCount; ++i) {
+        totalHitCount += totals[i];
+    }
+
+	cudaFree(d_pSums);
+	cudaFree(d_totals);
+	free(totals);
+
+	approxPi = ((double)totalHitCount / sampleSize) / generateThreadCount ;
+	approxPi = approxPi * 4.0f;
+		
 	return approxPi;
 }
